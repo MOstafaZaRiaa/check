@@ -284,26 +284,34 @@ The namespace (and any pull secret you created in it) is kept by default.
 
 Goal: prove the deployment works when everything comes from a private registry, following the same steps the client will follow with Quay.
 
-Set once (adjust):
+Set once (adjust). **Never type the password into this file** (it lives in OneDrive and will be reused for the client runbook); the `read` line prompts for it:
 ```bash
-export REG=harbor.lab.datascience.me            # host only, no https://, add :port if not 443
-export REG_USER='robot$k8s_cluster_pull_secret'
-export REG_PASS='zZVHae1Xmu3iJJvIbL9mwsfx48byDR4r'
+export REG_HOST=harbor.lab.datascience.me       # host only, no https://, add :port if not 443
+export REG=$REG_HOST/monitoring                 # host + the ONE Harbor project that holds everything
+export REG_USER='robot$<account-with-push-rights>'   # single quotes: the $ is part of a Harbor robot name
+read -rs -p 'Harbor password: ' REG_PASS; export REG_PASS; echo
 ```
+`REG_HOST` is used where a registry **host** is required (login, CA trust, pull secret). `REG` (host + project) is used for image and chart paths.
 
-### B1. Create the Harbor projects
-Harbor does not auto-create projects. Create these (private is fine):
+### B1. Create ONE Harbor project: `monitoring`
+Harbor does not auto-create projects, but you only need one (private is fine). Everything goes inside it:
 
-| Project | Holds |
+| Path inside project `monitoring` | Holds |
 |---|---|
-| `grafana` | image `grafana/grafana` (and `grafana/tempo` if used) |
-| `kiwigrid` | image `k8s-sidecar` |
-| `openshift4` | image `ose-oauth-proxy` |
-| `prometheus` | image `pushgateway` (Viya option) |
-| `grafana-community` | Helm chart `grafana` (and `tempo` if used) |
-| `prometheus-community` | Helm chart `prometheus-pushgateway` (Viya option) |
+| `grafana/grafana` | Grafana image (and `grafana/tempo` if used) |
+| `kiwigrid/k8s-sidecar` | Sidecar image |
+| `openshift4/ose-oauth-proxy` | oauth-proxy image |
+| `prometheus/pushgateway` | Pushgateway image (Viya option) |
+| `grafana-community/grafana` | Grafana Helm chart (and `tempo` if used) |
+| `prometheus-community/prometheus-pushgateway` | Pushgateway Helm chart (Viya option) |
 
-The path rule comes from `bin/setup_airgap.sh`: an image `registry/REPO/IMAGE:TAG` is pushed to `$REG/REPO/IMAGE:TAG`, and a chart is pushed to `oci://$REG/<chart-repo-name>`. The deployment scripts build their image and chart references from the same rule, so the paths must match exactly.
+**Why this works.** The scripts build every image reference as `AIRGAP_REGISTRY` + `/<original repo>/<image>:<tag>`, and every chart reference as `oci://AIRGAP_HELM_REPO/<chart repo>/<chart>` (`AIRGAP_HELM_REPO` defaults to `AIRGAP_REGISTRY`). The registry value is used as a plain prefix (checked in `bin/common.sh` `generateImageKeysFile`, and in the Grafana, oauth-proxy and Pushgateway templates). So setting `AIRGAP_REGISTRY=<host>/monitoring` (step B6) puts `monitoring/` in front of every path, with no script changes. The repository names become multi-level (`monitoring/grafana/grafana`), which both registries accept, with the conditions below.
+
+**Account rights.** The account you push with needs **push and pull** on project `monitoring`. A robot account whose name says "pull_secret" is normally pull-only, so it cannot push. Use a push-capable account on the bastion, and keep the pull-only robot for the cluster's `v4m-image-pull-secret` (B5).
+
+**Registry support for multi-level names.**
+- **Harbor:** push and pull of nested names work (Harbor proxy-cache projects create the same kind of paths). Older Harbor versions had UI/REST quirks with names containing several slashes; they do not affect push/pull.
+- **Quay (client):** nested names need the Quay config option `FEATURE_EXTENDED_REPOSITORY_NAMES`, which Red Hat says was added in Quay 3.6 and is set in `config.yaml` by default ([Red Hat Quay release notes](https://docs.redhat.com/en/documentation/red_hat_quay/3.15/html-single/red_hat_quay_release_notes/index)). **Harbor passing does not prove Quay accepts it**, so the client runbook starts with a one-image test push (`<quay-host>/monitoring/test/hello:1`). In Quay the `monitoring` **organization** must exist first; repositories are created on push.
 
 ### B2. Trust Harbor's CA (skip if Harbor has a publicly trusted cert)
 
@@ -314,13 +322,13 @@ On the deployment host:
 #   Ubuntu:  sudo cp harbor-ca.crt /usr/local/share/ca-certificates/harbor-ca.crt && sudo update-ca-certificates
 
 # Optional, Podman-only alternative if you do not want to touch the OS trust store
-# (the folder name must match $REG exactly, including :port if there is one):
-sudo mkdir -p /etc/containers/certs.d/$REG && sudo cp harbor-ca.crt /etc/containers/certs.d/$REG/ca.crt
+# (the folder name must match $REG_HOST exactly, including :port if there is one):
+sudo mkdir -p /etc/containers/certs.d/$REG_HOST && sudo cp harbor-ca.crt /etc/containers/certs.d/$REG_HOST/ca.crt
 ```
 Helm reads only the OS trust store, so do the first step even if you use the Podman-only folder.
 In the cluster (so nodes can pull from Harbor; no node reboot):
 ```bash
-oc create configmap registry-cas -n openshift-config --from-file=$REG=harbor-ca.crt
+oc create configmap registry-cas -n openshift-config --from-file=$REG_HOST=harbor-ca.crt
 oc patch image.config.openshift.io/cluster --type=merge -p '{"spec":{"additionalTrustedCA":{"name":"registry-cas"}}}'
 ```
 If Harbor uses a port, the ConfigMap key must replace `:` with `..` (for example `harbor.mylab.local..5000`).
@@ -329,7 +337,7 @@ Do **not** use `registrySources.insecureRegistries`; it triggers a node rollout.
 
 ### B3. Mirror the images
 ```bash
-echo "$REG_PASS" | podman login $REG -u "$REG_USER" --password-stdin
+echo "$REG_PASS" | podman login $REG_HOST -u "$REG_USER" --password-stdin
 
 # Grafana
 podman pull docker.io/grafana/grafana:13.0.3
@@ -375,7 +383,7 @@ helm repo add grafana-community https://grafana-community.github.io/helm-charts
 helm repo update
 mkdir -p ~/v4m-charts && helm pull grafana-community/grafana --version 12.10.4 --destination ~/v4m-charts
 
-echo "$REG_PASS" | helm registry login $REG -u "$REG_USER" --password-stdin
+echo "$REG_PASS" | helm registry login $REG_HOST -u "$REG_USER" --password-stdin
 helm push ~/v4m-charts/grafana-12.10.4.tgz oci://$REG/grafana-community
 ```
 **Optional Viya add-on:**
@@ -397,24 +405,26 @@ The pull secret must exist **before** the deploy script runs: `airgap-include.sh
 oc get ns monitoring || oc create ns monitoring
 
 oc create secret docker-registry v4m-image-pull-secret -n monitoring \
-  --docker-server=$REG --docker-username="$REG_USER" --docker-password="$REG_PASS"
+  --docker-server=$REG_HOST --docker-username="$REG_USER" --docker-password="$REG_PASS"
 ```
+Use the registry **host** for `--docker-server` (not `host/monitoring`), and preferably a **pull-only** robot here (see B1, "Account rights"): the cluster only ever needs to pull.
 If you also run `deploy_monitoring_viya.sh`, create the same secret in the Viya namespace, because that script checks `VIYA_NS` in air-gap mode.
 
 ### B6. Switch on air-gap mode
 Append to `$USER_DIR/user.env`:
 ```
 AIRGAP_DEPLOYMENT=true
-AIRGAP_REGISTRY=harbor.mylab.local
+AIRGAP_REGISTRY=harbor.lab.datascience.me/monitoring
 AIRGAP_IMAGE_PULL_SECRET_NAME=v4m-image-pull-secret
 AIRGAP_HELM_FORMAT=oci
 ```
+`AIRGAP_REGISTRY` is `<host>/monitoring` (host **plus** the project), the same value as `$REG`. Do not set `AIRGAP_HELM_REPO`; it then defaults to the same value, which matches where B4 pushes the charts.
 `AIRGAP_REGISTRY_USERNAME/PASSWORD` are only needed by `setup_airgap.sh`, not by the deploy scripts.
 
 ### B7. Deploy from Harbor
 ```bash
 export USER_DIR=$HOME/v4m-user
-helm registry login $REG -u "$REG_USER"        # deploy scripts pull the chart with the cached login
+echo "$REG_PASS" | helm registry login $REG_HOST -u "$REG_USER" --password-stdin   # deploy scripts pull the chart with the cached login
 monitoring/bin/deploy_monitoring_openshift.sh 2>&1 | tee ~/v4m-monitoring-stageB.log
 ```
 Expect the log line `Deploying into an 'air-gapped' cluster from private registry [harbor...]`.
@@ -441,7 +451,8 @@ To make the rehearsal stricter, block the worker nodes' internet access (or fire
 | `x509: certificate signed by unknown authority` from a pod | Cluster does not trust Harbor's CA (B2, `additionalTrustedCA`) |
 | `x509` from `helm` on the host | Harbor CA not in the OS trust store |
 | `unauthorized` on pull | Wrong pull-secret credentials, or the secret is in the wrong namespace |
-| `helm push` denied | Harbor project missing or the user lacks push rights |
+| `helm push` / `podman push` denied | Project `monitoring` missing, or the account lacks **push** rights (a "pull_secret" robot is usually pull-only) |
+| Push rejected with an "invalid name" style error (Quay) | Nested repository names not enabled: `FEATURE_EXTENDED_REPOSITORY_NAMES` (see B1) |
 | `helm repo update` aborts | See the known risk in B7 |
 
 ---
@@ -477,6 +488,7 @@ The scripts `cd` to the repo root themselves, but `chmod` (section 0) and `oc ap
 | 2026-09-20 | `cluster-monitoring-config` in `openshift-monitoring` | Not found | Script (or the manual `oc apply` above) creates it with `enableUserWorkload: true` |
 | 2026-09-20 | Storage write test on `truenas-nfs` | Not run as a separate test. Indirect evidence: Grafana started on its PVC and an OpenShift user was auto-created in Grafana (that writes to the database on the PVC) | Confirm with `oc get pvc,pods -n monitoring` (PVC `Bound`, pod not restarting) |
 | 2026-09-20 11:16 | **Stage A (connected) — deploy script** | **Completed:** `Successfully deployed SAS Viya Monitoring for OpenShift`. Helm releases `v4m-grafana` and `v4m-metrics` installed (revision 1). Route `https://v4m-grafana-monitoring.apps.ocp.lab.datascience.me` reachable, OpenShift login worked, 13 dashboards listed (OpenSearch, PostgreSQL, RabbitMQ, SAS CAS/Go/Java/Arke/Launched Jobs/Micro Analytic/Viya Welcome) | Deployment works |
+| 2026-09-20 | Registry layout decision | Harbor host `harbor.lab.datascience.me`; **one project `monitoring`** for all images and charts, via `AIRGAP_REGISTRY=harbor.lab.datascience.me/monitoring` (Podman used for mirroring, on the lab and at the client) | Client needs a Quay organization `monitoring` and nested repository names enabled; verify with a test push first |
 | — | Stage A — remaining checks | *pending:* pod containers all Ready, Prometheus datasource "Save & test", `up` query in Explore returns data | Stage A is fully passed only after these three |
 | — | Stage B (Harbor) | *pending* | |
 
