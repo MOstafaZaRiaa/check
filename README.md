@@ -419,6 +419,8 @@ AIRGAP_IMAGE_PULL_SECRET_NAME=v4m-image-pull-secret
 AIRGAP_HELM_FORMAT=oci
 ```
 `AIRGAP_REGISTRY` is `<host>/monitoring` (host **plus** the project), the same value as `$REG`. Do not set `AIRGAP_HELM_REPO`; it then defaults to the same value, which matches where B4 pushes the charts.
+
+**Sample-file typo.** `samples/generic-base/user.env` contains `# AIRGAP_HELM_FORMAT: oci` (a colon, not `=`). If you uncomment that line instead of typing it, the script prints `export: 'AIRGAP_HELM_FORMAT:': not a valid identifier`. This happened in the lab run. It was harmless only because `oci` is the default; if you needed `tgz` the setting would have been silently ignored. Always write `AIRGAP_HELM_FORMAT=oci` (or `=tgz`).
 `AIRGAP_REGISTRY_USERNAME/PASSWORD` are only needed by `setup_airgap.sh`, not by the deploy scripts.
 
 ### B7. Deploy from Harbor
@@ -427,7 +429,7 @@ export USER_DIR=$HOME/v4m-user
 echo "$REG_PASS" | helm registry login $REG_HOST -u "$REG_USER" --password-stdin   # deploy scripts pull the chart with the cached login
 monitoring/bin/deploy_monitoring_openshift.sh 2>&1 | tee ~/v4m-monitoring-stageB.log
 ```
-Expect the log line `Deploying into an 'air-gapped' cluster from private registry [harbor...]`.
+Expect the log line `Deploying into an 'air-gapped' cluster from private registry [<host>/monitoring]`, and during the Grafana install a line like `Pulled: <host>/monitoring/grafana-community/grafana:12.10.4` (proof the chart came from the registry).
 
 **Known risk — `helm repo update`:** `deploy_monitoring_openshift.sh` line 41 (and `deploy_monitoring_viya.sh` line 33) run `helm repo update` even in air-gap mode, under `set -e`. On the host where you added `grafana-community` in B4 this only warns. On a host with no Helm repos configured I expect it to abort with "no repositories found". Fix: run `helm repo add grafana-community https://grafana-community.github.io/helm-charts` once on that host (it does not need to be reachable), or wrap those lines in `if [ "$AIRGAP_DEPLOYMENT" != "true" ]; then ... fi`.
 
@@ -440,6 +442,24 @@ Every image must start with `$REG/`. Repeat the browser checks from Stage A.
 To make the rehearsal stricter, block the worker nodes' internet access (or firewall docker.io, quay.io, ghcr.io, registry.redhat.io) and re-run `remove_monitoring_openshift.sh` then the deploy.
 
 **Stage B passes when:** the pod is Ready, every container image is from Harbor, and Grafana works exactly as in Stage A.
+
+### B9. Optional: test the two ways `helm repo update` can misbehave in an air gap
+Your lab bastion has Helm repos and internet, so B7 could not exercise the known risk. These two commands simulate a bastion with no repos and one with only an unreachable repo. They use throw-away Helm config files and do not touch your real ones:
+```bash
+# 1. No repositories configured at all
+HELM_REPOSITORY_CONFIG=$(mktemp) HELM_REPOSITORY_CACHE=$(mktemp -d) helm repo update; echo "exit code: $?"
+
+# 2. A repository is configured but unreachable
+cat > /tmp/dead-repos.yaml <<'EOF'
+apiVersion: ""
+generated: "2026-01-01T00:00:00Z"
+repositories:
+- name: dead
+  url: http://127.0.0.1:9
+EOF
+HELM_REPOSITORY_CONFIG=/tmp/dead-repos.yaml HELM_REPOSITORY_CACHE=$(mktemp -d) helm repo update; echo "exit code: $?"
+```
+An exit code other than `0` in either case means `deploy_monitoring_openshift.sh` would stop at that line under `set -e` (B7, "Known risk"). Record both results in section 6. The client runbook repeats these two tests on the client's bastion before deploying.
 
 ### Stage B troubleshooting
 
@@ -460,7 +480,7 @@ To make the rehearsal stricter, block the worker nodes' internet access (or fire
 ## 5. Things to know (also relevant for the client)
 
 - **Token lifetime.** Grafana's access to OpenShift monitoring uses a token created with `--duration 12000h`. OpenShift may cap this (the script's own comment says possibly 12 months). Re-run `deploy_monitoring_openshift.sh` before it expires, or the Prometheus datasource will start failing with 401.
-- **Who can log in.** In `monitoring/openshift/grafana-proxy-patch-*.template` the `-openshift-sar` / `-openshift-delegate-urls` lines are commented out, and `grafana-proxy-values.yaml` sets `auto_assign_org_role: Admin`. From reading the files, that means any user who can authenticate to OpenShift gets Grafana **Admin**. Please confirm this on your test cluster (log in with a non-admin OpenShift user) and decide whether the client needs it tightened.
+- **Who can log in.** In `monitoring/openshift/grafana-proxy-patch-*.template` the `-openshift-sar` / `-openshift-delegate-urls` lines are commented out, and `grafana-proxy-values.yaml` sets `auto_assign_org_role: Admin`. From reading the files, that means any user who can authenticate to OpenShift gets Grafana **Admin**. **Confirmed in the lab on 2026-09-20:** a non-admin OpenShift user logged in and saw the Grafana Administration menu (Users, Teams, Service accounts). The client must decide before go-live who may use Grafana; the options are in the client runbook (part 10). Neither option has been tested yet.
 - **Static cookie secret.** `grafana-proxy-secret.yaml` contains a fixed `session_secret` that is published in the repo. Replace it if the client's security team objects.
 - **`latest` tags.** oauth-proxy and busybox (logging only) use `:latest`. Pin the digest or tag you tested when you carry images to the client.
 
@@ -490,7 +510,10 @@ The scripts `cd` to the repo root themselves, but `chmod` (section 0) and `oc ap
 | 2026-09-20 11:16 | **Stage A (connected) — deploy script** | **Completed:** `Successfully deployed SAS Viya Monitoring for OpenShift`. Helm releases `v4m-grafana` and `v4m-metrics` installed (revision 1). Route `https://v4m-grafana-monitoring.apps.ocp.lab.datascience.me` reachable, OpenShift login worked, 13 dashboards listed (OpenSearch, PostgreSQL, RabbitMQ, SAS CAS/Go/Java/Arke/Launched Jobs/Micro Analytic/Viya Welcome) | Deployment works |
 | 2026-09-20 | Registry layout decision | Harbor host `harbor.lab.datascience.me`; **one project `monitoring`** for all images and charts, via `AIRGAP_REGISTRY=harbor.lab.datascience.me/monitoring` (Podman used for mirroring, on the lab and at the client) | Client needs a Quay organization `monitoring` and nested repository names enabled; verify with a test push first |
 | — | Stage A — remaining checks | *pending:* pod containers all Ready, Prometheus datasource "Save & test", `up` query in Explore returns data | Stage A is fully passed only after these three |
-| — | Stage B (Harbor) | *pending* | |
+| 2026-09-20 13:16 UTC | **Stage B (Harbor, `AIRGAP_DEPLOYMENT=true`)** | **Completed:** `Successfully deployed`. Chart pulled from `harbor.lab.datascience.me/monitoring/grafana-community/grafana:12.10.4`. All 4 pod containers use Harbor images: `.../monitoring/openshift4/ose-oauth-proxy:latest`, `.../monitoring/kiwigrid/k8s-sidecar:2.10.1` (x2), `.../monitoring/grafana/grafana:13.0.3`. Grafana home page loaded on the new deployment | Single-project `monitoring` layout works with the scripts unchanged. Note: the cluster still had internet access, so this proves the paths, not that nothing reaches the internet |
+| 2026-09-20 | `AIRGAP_HELM_FORMAT: oci` in `user.env` | Script printed `export: ... not a valid identifier` | Sample-file typo (colon instead of `=`); fixed in B6 note. Harmless only because `oci` is the default |
+| 2026-09-20 | Non-admin OpenShift user logs in to Grafana | **Gets the Administration menu (Grafana Admin)** — confirmed | Security decision for the client (runbook part 10) |
+| — | `helm repo update` failure modes (B9) | *pending* | |
 
 Browser note: the machine you browse from must resolve `*.apps.ocp.lab.datascience.me` (DNS or hosts file), or the OpenShift login page will not load.
 
