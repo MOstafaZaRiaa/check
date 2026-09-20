@@ -47,7 +47,7 @@ The scripts are **bash**. Use a Linux host or WSL2 (Ubuntu) that can reach the O
 | `kubectl` | 1.27+ | |
 | `helm` | 3.8+ (v3 or v4) | OCI support needs 3.8+ |
 | `yq` (mikefarah) | **4.45.1+** | Not the Python `yq` |
-| `docker` or `skopeo` | any | Stage B only |
+| `podman` | any recent | Stage B (lab and client both use Podman). `skopeo` is optional (only to list tags). Only `bin/setup_airgap.sh` insists on a command named `docker`, and this guide does not use that script; if you ever run it, install `podman-docker` (RHEL) so a `docker` command exists |
 | `openssl`, `sha256sum` | any | |
 
 Check:
@@ -309,12 +309,15 @@ The path rule comes from `bin/setup_airgap.sh`: an image `registry/REPO/IMAGE:TA
 
 On the deployment host:
 ```bash
-# Docker
-sudo mkdir -p /etc/docker/certs.d/$REG && sudo cp harbor-ca.crt /etc/docker/certs.d/$REG/ca.crt
-# OS trust store (Helm uses this; the deploy scripts do not pass --ca-file)
+# OS trust store: covers Podman, skopeo AND Helm (the deploy scripts do not pass --ca-file to Helm)
 #   RHEL:    sudo cp harbor-ca.crt /etc/pki/ca-trust/source/anchors/ && sudo update-ca-trust
 #   Ubuntu:  sudo cp harbor-ca.crt /usr/local/share/ca-certificates/harbor-ca.crt && sudo update-ca-certificates
+
+# Optional, Podman-only alternative if you do not want to touch the OS trust store
+# (the folder name must match $REG exactly, including :port if there is one):
+sudo mkdir -p /etc/containers/certs.d/$REG && sudo cp harbor-ca.crt /etc/containers/certs.d/$REG/ca.crt
 ```
+Helm reads only the OS trust store, so do the first step even if you use the Podman-only folder.
 In the cluster (so nodes can pull from Harbor; no node reboot):
 ```bash
 oc create configmap registry-cas -n openshift-config --from-file=$REG=harbor-ca.crt
@@ -326,39 +329,41 @@ Do **not** use `registrySources.insecureRegistries`; it triggers a node rollout.
 
 ### B3. Mirror the images
 ```bash
-echo "$REG_PASS" | docker login $REG -u "$REG_USER" --password-stdin
+echo "$REG_PASS" | podman login $REG -u "$REG_USER" --password-stdin
 
 # Grafana
-docker pull docker.io/grafana/grafana:13.0.3
-docker tag  docker.io/grafana/grafana:13.0.3 $REG/grafana/grafana:13.0.3
-docker push $REG/grafana/grafana:13.0.3
+podman pull docker.io/grafana/grafana:13.0.3
+podman tag  docker.io/grafana/grafana:13.0.3 $REG/grafana/grafana:13.0.3
+podman push $REG/grafana/grafana:13.0.3
 
 # Sidecar
-docker pull quay.io/kiwigrid/k8s-sidecar:2.10.1
-docker tag  quay.io/kiwigrid/k8s-sidecar:2.10.1 $REG/kiwigrid/k8s-sidecar:2.10.1
-docker push $REG/kiwigrid/k8s-sidecar:2.10.1
+podman pull quay.io/kiwigrid/k8s-sidecar:2.10.1
+podman tag  quay.io/kiwigrid/k8s-sidecar:2.10.1 $REG/kiwigrid/k8s-sidecar:2.10.1
+podman push $REG/kiwigrid/k8s-sidecar:2.10.1
 ```
+(Only for a lab Harbor with a self-signed cert you have **not** trusted in B2: add `--tls-verify=false` to `podman login` and `podman push`.)
+
+`podman pull` fetches the image for the CPU architecture of the host you run it on. That is fine when the bastion and the cluster nodes are both x86_64. Check with `uname -m` and `oc get nodes -o jsonpath='{.items[*].status.nodeInfo.architecture}'`.
+
 **Optional Viya add-on:**
 ```bash
-docker pull quay.io/prometheus/pushgateway:v1.11.3
-docker tag  quay.io/prometheus/pushgateway:v1.11.3 $REG/prometheus/pushgateway:v1.11.3
-docker push $REG/prometheus/pushgateway:v1.11.3
+podman pull quay.io/prometheus/pushgateway:v1.11.3
+podman tag  quay.io/prometheus/pushgateway:v1.11.3 $REG/prometheus/pushgateway:v1.11.3
+podman push $REG/prometheus/pushgateway:v1.11.3
 ```
 
-**oauth-proxy** (not handled by `setup_airgap.sh`; needs Red Hat credentials). Reuse the cluster's pull secret:
+**oauth-proxy** (not handled by `setup_airgap.sh`; needs Red Hat credentials). Reuse the cluster's pull secret for the pull only; the push uses the `podman login` from above:
 ```bash
 oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > redhat-auth.json
 
-skopeo inspect --authfile redhat-auth.json docker://registry.redhat.io/openshift4/ose-oauth-proxy:latest | head    # confirm the tag exists
+podman pull --authfile redhat-auth.json registry.redhat.io/openshift4/ose-oauth-proxy:latest
+podman tag  registry.redhat.io/openshift4/ose-oauth-proxy:latest $REG/openshift4/ose-oauth-proxy:latest
+podman push $REG/openshift4/ose-oauth-proxy:latest
 
-skopeo copy --src-authfile redhat-auth.json \
-  --dest-creds "$REG_USER:$REG_PASS" \
-  docker://registry.redhat.io/openshift4/ose-oauth-proxy:latest \
-  docker://$REG/openshift4/ose-oauth-proxy:latest
+rm -f redhat-auth.json      # it contains Red Hat credentials
 ```
-(Add `--dest-tls-verify=false` only for a lab Harbor with a self-signed cert you have not trusted.)
 
-If `:latest` does not resolve, list the tags (`skopeo list-tags --authfile redhat-auth.json docker://registry.redhat.io/openshift4/ose-oauth-proxy`), mirror a specific one, and put this in `$USER_DIR/user.env`:
+If the pull fails with `manifest unknown` (the tag does not exist), list the tags with skopeo (`skopeo list-tags --authfile redhat-auth.json docker://registry.redhat.io/openshift4/ose-oauth-proxy`, before deleting the auth file), mirror a specific one, and put this in `$USER_DIR/user.env`:
 ```
 OPENSHIFT_OAUTHPROXY_FULL_IMAGE="registry.redhat.io/openshift4/ose-oauth-proxy:<tag>"
 ```
